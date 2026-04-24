@@ -5,35 +5,39 @@ import re
 import logging
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import GetForumTopicsRequest
 
-# =====================================================
-# CONFIGURAÇÕES
-# =====================================================
 API_ID         = int(os.environ.get("TELEGRAM_API_ID", "35413457"))
 API_HASH       = os.environ.get("TELEGRAM_API_HASH", "10b8fcf078013163bdda6e6cc5edb5a9")
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 CANAL_ID       = int(os.environ.get("CANAL_USERNAME", "-1002362134244"))
 N8N_WEBHOOK    = os.environ.get("N8N_WEBHOOK_URL", "")
 
-LIMITE_POR_TOPICO = 1
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-SHOPEE_REGEX   = re.compile(r'https?://s\.shopee\.com\.br/\S+')
-CATEGORY_REGEX = re.compile(r'#(\w+)', re.IGNORECASE)
+SHOPEE_REGEX = re.compile(r'https?://s\.shopee\.com\.br/\S+')
 
-CATEGORIAS_MAPA = {
-    'moda': 'Moda', 'acessorios': 'Acessorios', 'acessório': 'Acessorios',
-    'acessórios': 'Acessorios', 'beleza': 'Beleza', 'banheiro': 'Banheiro',
-    'cozinha': 'Cozinha', 'utilidades': 'Utilidades', 'dublados': 'Dublados',
-    'decoracao': 'Decoracao', 'decoração': 'Decoracao', 'eletronicos': 'Eletronicos',
-    'eletrônicos': 'Eletronicos', 'pet': 'Pet', 'automoveis': 'Automoveis',
-    'automóveis': 'Automoveis', 'infantil': 'Infantil', 'maternidade': 'Maternidade',
-    'papelaria': 'Papelaria', 'artesanato': 'Artesanato', 'esporte': 'Esporte',
-    'seguranca': 'Seguranca', 'segurança': 'Seguranca',
-}
+# Todos os tópicos mapeados
+TOPICOS = [
+    (2,    "Automoveis"),
+    (3,    "Dublados"),
+    (6,    "Banheiro"),
+    (7,    "Cozinha"),
+    (8,    "Pet"),
+    (9,    "Beleza"),
+    (10,   "Moda"),
+    (11,   "Eletronicos"),
+    (12,   "Acessorios"),
+    (19,   "Decoracao"),
+    (49,   "Maternidade"),
+    (78,   "Papelaria"),
+    (80,   "Utilidades"),
+    (92,   "Seguranca"),
+    (159,  "Artesanato"),
+    (500,  "Infantil"),
+    (1167, "Esporte"),
+]
+# ID 1 (+ 2MIL VÍDEOS) ignorado — é arquivo geral, não categoria
 
 async def enviar_para_n8n(session, video_bytes, shopee_link, categoria, msg_id):
     try:
@@ -45,137 +49,86 @@ async def enviar_para_n8n(session, video_bytes, shopee_link, categoria, msg_id):
         form.add_field("origem", "HISTORICO")
         async with session.post(N8N_WEBHOOK, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
             if resp.status == 200:
-                log.info(f"✅ n8n OK | Categoria: {categoria} | msg_id: {msg_id}")
+                log.info(f"  ✅ n8n OK | {categoria} | msg_id: {msg_id}")
                 return True
-            else:
-                log.error(f"❌ n8n erro {resp.status}: {await resp.text()}")
-                return False
+            log.error(f"  ❌ n8n erro {resp.status}: {await resp.text()}")
+            return False
     except Exception as e:
-        log.error(f"❌ Erro envio n8n: {e}")
+        log.error(f"  ❌ Erro envio: {e}")
         return False
+
+async def pegar_video_do_topico(client, entity, topic_id, categoria):
+    log.info(f"\n📂 [{categoria}] topic_id: {topic_id}")
+    try:
+        count = 0
+        async for msg in client.iter_messages(entity, limit=100, reply_to=topic_id):
+            count += 1
+            if not msg.media:
+                continue
+            media_type = type(msg.media).__name__
+            if 'Document' not in media_type and 'Video' not in media_type:
+                continue
+            text = msg.text or msg.message or ""
+            shopee_match = SHOPEE_REGEX.search(text)
+            if not shopee_match:
+                continue
+            shopee_link = shopee_match.group(0).strip()
+            log.info(f"  📎 Link: {shopee_link[:50]}...")
+            return msg, shopee_link
+        log.info(f"  ⚠️ Nenhum vídeo válido ({count} msgs verificadas)")
+    except Exception as e:
+        log.error(f"  ❌ Erro ao ler tópico: {e}")
+    return None, None
 
 async def importar_historico():
     if not SESSION_STRING or not N8N_WEBHOOK:
-        log.error("Variáveis de ambiente não configuradas!")
+        log.error("❌ SESSION_STRING ou N8N_WEBHOOK não configurados!")
         return
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
     me = await client.get_me()
-    log.info(f"Conectado como: {me.first_name}")
+    log.info(f"✅ Conectado: {me.first_name} (@{me.username})")
 
     entity = await client.get_entity(CANAL_ID)
-    log.info(f"Canal: {entity.title}")
-
-    # Busca os tópicos do canal
-    log.info("Buscando tópicos do canal...")
-    try:
-        result = await client(GetForumTopicsRequest(
-            channel=entity,
-            offset_date=0,
-            offset_id=0,
-            offset_topic=0,
-            limit=100,
-            q=""
-        ))
-        topics = result.topics
-        log.info(f"Encontrados {len(topics)} tópicos")
-    except Exception as e:
-        log.error(f"Erro ao buscar tópicos: {e}")
-        log.info("Canal pode não ter tópicos. Tentando leitura direta...")
-        topics = []
+    log.info(f"✅ Canal: {entity.title}")
+    log.info(f"📋 Total de tópicos: {len(TOPICOS)}")
+    log.info("=" * 50)
 
     total_enviados = 0
-    coletados = {}
+    pulados = []
 
     async with aiohttp.ClientSession() as http_session:
+        for topic_id, categoria in TOPICOS:
+            msg, shopee_link = await pegar_video_do_topico(client, entity, topic_id, categoria)
 
-        if topics:
-            # Lê mensagens de cada tópico
-            for topic in topics:
-                topic_id   = topic.id
-                topic_nome = topic.title
-                log.info(f"\n📂 Tópico: {topic_nome} (ID: {topic_id})")
+            if not msg or not shopee_link:
+                pulados.append(categoria)
+                continue
 
-                encontrado = False
-                async for msg in client.iter_messages(entity, limit=200, reply_to=topic_id):
-                    if encontrado:
-                        break
-                    if not msg.media:
-                        continue
-                    media_type = type(msg.media).__name__
-                    if 'Document' not in media_type and 'Video' not in media_type:
-                        continue
+            log.info(f"  📥 Baixando vídeo (msg_id: {msg.id})...")
+            try:
+                video_bytes = await client.download_media(msg, bytes)
+                log.info(f"  📦 {len(video_bytes)/1024/1024:.1f} MB")
+            except Exception as e:
+                log.error(f"  ❌ Erro download: {e}")
+                pulados.append(categoria)
+                continue
 
-                    text = msg.text or msg.message or ""
-                    shopee_match = SHOPEE_REGEX.search(text)
-                    if not shopee_match:
-                        continue
+            sucesso = await enviar_para_n8n(http_session, video_bytes, shopee_link, categoria, msg.id)
+            if sucesso:
+                total_enviados += 1
+            else:
+                pulados.append(categoria)
 
-                    shopee_link = shopee_match.group(0).strip()
-
-                    # Tenta extrair categoria do texto ou usa o nome do tópico
-                    cat_match = CATEGORY_REGEX.search(text)
-                    if cat_match:
-                        categoria = CATEGORIAS_MAPA.get(cat_match.group(1).lower(), topic_nome)
-                    else:
-                        categoria = CATEGORIAS_MAPA.get(topic_nome.lower(), topic_nome)
-
-                    log.info(f"📥 Baixando | Categoria: {categoria} | msg_id: {msg.id}")
-                    try:
-                        video_bytes = await client.download_media(msg, bytes)
-                        log.info(f"✅ {len(video_bytes)/1024/1024:.1f} MB baixado")
-                    except Exception as e:
-                        log.error(f"Erro download: {e}")
-                        continue
-
-                    sucesso = await enviar_para_n8n(http_session, video_bytes, shopee_link, categoria, msg.id)
-                    if sucesso:
-                        coletados[categoria] = coletados.get(categoria, 0) + 1
-                        total_enviados += 1
-                        encontrado = True
-                        log.info(f"📊 Total enviados: {total_enviados} | {coletados}")
-
-                    await asyncio.sleep(3)
-        else:
-            # Fallback: leitura direta
-            log.info("Lendo mensagens diretamente...")
-            async for msg in client.iter_messages(entity, limit=3000):
-                if not msg.media:
-                    continue
-                media_type = type(msg.media).__name__
-                if 'Document' not in media_type and 'Video' not in media_type:
-                    continue
-                text = msg.text or msg.message or ""
-                shopee_match = SHOPEE_REGEX.search(text)
-                if not shopee_match:
-                    continue
-                shopee_link = shopee_match.group(0).strip()
-                cat_match = CATEGORY_REGEX.search(text)
-                if not cat_match:
-                    continue
-                cat_raw   = cat_match.group(1).lower()
-                categoria = CATEGORIAS_MAPA.get(cat_raw, cat_raw.capitalize())
-                if coletados.get(categoria, 0) >= LIMITE_POR_TOPICO:
-                    continue
-                log.info(f"📥 Baixando | Categoria: {categoria} | msg_id: {msg.id}")
-                try:
-                    video_bytes = await client.download_media(msg, bytes)
-                    log.info(f"✅ {len(video_bytes)/1024/1024:.1f} MB")
-                except Exception as e:
-                    log.error(f"Erro: {e}")
-                    continue
-                sucesso = await enviar_para_n8n(http_session, video_bytes, shopee_link, categoria, msg.id)
-                if sucesso:
-                    coletados[categoria] = coletados.get(categoria, 0) + 1
-                    total_enviados += 1
-                    log.info(f"📊 {total_enviados} enviados | {coletados}")
-                await asyncio.sleep(3)
+            await asyncio.sleep(5)
 
     await client.disconnect()
     log.info("=" * 50)
-    log.info(f"IMPORTAÇÃO CONCLUÍDA! Total: {total_enviados}")
-    log.info(f"Por categoria: {coletados}")
+    log.info(f"✅ IMPORTAÇÃO CONCLUÍDA!")
+    log.info(f"   Enviados: {total_enviados}/{len(TOPICOS)}")
+    if pulados:
+        log.info(f"   Pulados:  {pulados}")
     log.info("=" * 50)
 
 if __name__ == "__main__":
