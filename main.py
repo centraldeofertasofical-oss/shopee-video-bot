@@ -1,7 +1,6 @@
 import os
 import asyncio
 import aiohttp
-import aiofiles
 import re
 import logging
 from datetime import datetime
@@ -9,13 +8,13 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 # =====================================================
-# CONFIGURAÇÕES — via variáveis de ambiente
+# CONFIGURAÇÕES
 # =====================================================
 API_ID         = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH       = os.environ.get("TELEGRAM_API_HASH", "")
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
-CANAL_USERNAME = os.environ.get("CANAL_USERNAME", "")        # ex: achadinhos360
-N8N_WEBHOOK    = os.environ.get("N8N_WEBHOOK_URL", "")       # URL do webhook no n8n
+CANAL_INPUT    = os.environ.get("CANAL_USERNAME", "")  # pode ser username OU ID
+N8N_WEBHOOK    = os.environ.get("N8N_WEBHOOK_URL", "")
 
 # =====================================================
 # LOGGER
@@ -27,139 +26,140 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # =====================================================
-# REGEX — extrai link Shopee
+# REGEX
 # =====================================================
 SHOPEE_REGEX = re.compile(r'https?://s\.shopee\.com\.br/\S+')
 CATEGORY_REGEX = re.compile(r'#(\w+)')
 
 # =====================================================
-# CLIENTE TELEGRAM
+# CLIENT
 # =====================================================
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
+
 # =====================================================
-# HANDLER — nova mensagem no canal
+# RESOLVE CANAL (CORREÇÃO PRINCIPAL)
 # =====================================================
-@client.on(events.NewMessage(chats=CANAL_USERNAME))
-async def handler(event):
-    msg = event.message
-
-    # Só processa se tiver mídia de vídeo
-    if not msg.media:
-        return
-
-    media = msg.media
-    media_type = type(media).__name__
-
-    # Aceita Document (vídeo enviado como arquivo) ou MessageMediaDocument
-    if 'Document' not in media_type and 'Video' not in media_type:
-        return
-
-    text = msg.text or msg.message or ""
-
-    # Extrai link Shopee
-    shopee_match = SHOPEE_REGEX.search(text)
-    if not shopee_match:
-        log.info(f"Mensagem sem link Shopee — ignorada. ID: {msg.id}")
-        return
-
-    shopee_link = shopee_match.group(0).strip()
-
-    # Extrai categoria do texto (#Beleza, #Moda, etc)
-    category_match = CATEGORY_REGEX.search(text)
-    categoria = category_match.group(1) if category_match else "Geral"
-
-    log.info(f"Vídeo detectado | Categoria: {categoria} | Link: {shopee_link}")
-
-    # Baixa o vídeo como bytes
+async def get_canal_entity():
     try:
-        log.info("Baixando vídeo do Telegram...")
-        video_bytes = await client.download_media(msg, bytes)
-        log.info(f"Vídeo baixado: {len(video_bytes)} bytes")
-    except Exception as e:
-        log.error(f"Erro ao baixar vídeo: {e}")
-        return
+        # Se for número → tratar como ID
+        if CANAL_INPUT.startswith("-100"):
+            canal = await client.get_entity(int(CANAL_INPUT))
+        else:
+            canal = await client.get_entity(CANAL_INPUT)
 
-    # Envia para o n8n via webhook
-    await enviar_para_n8n(
-        video_bytes=video_bytes,
-        shopee_link=shopee_link,
-        categoria=categoria,
-        msg_id=msg.id,
-        texto_original=text
-    )
+        log.info(f"Canal resolvido: {canal.title}")
+        return canal
+
+    except Exception as e:
+        log.error(f"Erro ao resolver canal: {e}")
+        raise
 
 
 # =====================================================
-# ENVIO PARA N8N
+# HANDLER
+# =====================================================
+async def setup_handler(canal):
+
+    @client.on(events.NewMessage(chats=canal))
+    async def handler(event):
+        msg = event.message
+
+        if not msg.media:
+            return
+
+        media_type = type(msg.media).__name__
+        if 'Document' not in media_type and 'Video' not in media_type:
+            return
+
+        text = msg.text or msg.message or ""
+
+        shopee_match = SHOPEE_REGEX.search(text)
+        if not shopee_match:
+            log.info(f"Ignorado (sem link Shopee) | ID: {msg.id}")
+            return
+
+        shopee_link = shopee_match.group(0).strip()
+
+        category_match = CATEGORY_REGEX.search(text)
+        categoria = category_match.group(1) if category_match else "Geral"
+
+        log.info(f"Vídeo OK | {categoria} | {msg.id}")
+
+        try:
+            video_bytes = await client.download_media(msg, bytes)
+        except Exception as e:
+            log.error(f"Erro download: {e}")
+            return
+
+        await enviar_para_n8n(video_bytes, shopee_link, categoria, msg.id, text)
+
+
+# =====================================================
+# ENVIO N8N
 # =====================================================
 async def enviar_para_n8n(video_bytes, shopee_link, categoria, msg_id, texto_original):
     if not N8N_WEBHOOK:
-        log.error("N8N_WEBHOOK_URL não configurado!")
+        log.error("Webhook não configurado")
         return
 
     try:
         async with aiohttp.ClientSession() as session:
             form = aiohttp.FormData()
-            form.add_field(
-                name="video",
-                value=video_bytes,
-                filename=f"video_{msg_id}.mp4",
-                content_type="video/mp4"
-            )
+            form.add_field("video", video_bytes, filename=f"video_{msg_id}.mp4", content_type="video/mp4")
             form.add_field("shopee_link", shopee_link)
             form.add_field("categoria", categoria)
             form.add_field("msg_id", str(msg_id))
             form.add_field("texto_original", texto_original)
             form.add_field("data_coleta", datetime.utcnow().isoformat())
 
-            log.info(f"Enviando para n8n webhook...")
-            async with session.post(N8N_WEBHOOK, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                status = resp.status
-                body = await resp.text()
-                if status == 200:
-                    log.info(f"n8n recebeu com sucesso | msg_id: {msg_id}")
+            async with session.post(N8N_WEBHOOK, data=form) as resp:
+                if resp.status == 200:
+                    log.info(f"n8n OK | {msg_id}")
                 else:
-                    log.error(f"n8n retornou status {status}: {body}")
+                    log.error(f"Erro n8n {resp.status}")
 
     except Exception as e:
-        log.error(f"Erro ao enviar para n8n: {e}")
+        log.error(f"Erro envio n8n: {e}")
 
 
 # =====================================================
-# HEALTH CHECK — porta para Railway detectar serviço ativo
+# HEALTH CHECK
 # =====================================================
 async def health_server():
     from aiohttp import web
 
     async def health(request):
-        return web.Response(text="OK — Shopee Video Bot rodando")
+        return web.Response(text="OK")
 
     app = web.Application()
     app.router.add_get("/health", health)
+
     runner = web.AppRunner(app)
     await runner.setup()
+
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    log.info(f"Health check rodando na porta {port}")
+
+    log.info(f"Health OK porta {port}")
 
 
 # =====================================================
 # MAIN
 # =====================================================
 async def main():
-    log.info("Iniciando Shopee Video Bot...")
-    log.info(f"Canal monitorado: {CANAL_USERNAME}")
+    log.info("Iniciando bot...")
 
     await health_server()
     await client.start()
-    log.info("Conectado ao Telegram!")
 
-    me = await client.get_me()
-    log.info(f"Logado como: {me.first_name} (@{me.username})")
+    log.info("Telegram conectado")
 
-    log.info("Aguardando vídeos no canal...")
+    canal = await get_canal_entity()
+    await setup_handler(canal)
+
+    log.info("Aguardando mensagens...")
     await client.run_until_disconnected()
 
 
